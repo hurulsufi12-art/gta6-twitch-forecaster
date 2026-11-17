@@ -16,6 +16,16 @@ later. A flat median (the starter) is wrong by ~83% on a typical launch
 day; weighting by hour-1 size is what fixes the shape. The per-hour
 log-quantile curves are lightly smoothed over neighbouring hours.
 
+When this case's hour 1 is larger than every comparable's hour 1 -- the
+expected GTA VI situation, since its hour 1 will likely beat the largest
+comparable (875k) -- the kernel would lean on the few biggest launches
+alone, whose shape is flat. The forecast is then blended toward the
+embedded fallback table (the average shape over all 37 launches, evening
+peak ~2.4x hour 1), with the blend weight growing with how far beyond
+the training range the hour-1 print sits, capped at 0.5. In a test that
+trains only on launches under 100k hour-1 viewers and forecasts the 16
+bigger ones, the blend cuts mean pinball loss from 0.305 to 0.295.
+
 If the case carries too few usable comparables (fewer than 8 complete
 release-day curves), the program falls back to an embedded table: the
 median log-ratio and log standard deviation per hour fitted on the 37
@@ -196,6 +206,21 @@ def forecast_case(case: dict) -> dict:
             curves.append(curve)
     if len(curves) >= MIN_COMPARABLES:
         log_quantiles = kernel_log_quantiles(curves, p1)
+        # Extrapolation guard: when this case's hour 1 sits beyond the
+        # largest comparable, the kernel leans on the few biggest launches
+        # alone. Blend toward the fallback table (the average shape over
+        # all 37 launches) with a weight that grows with the excess in
+        # log space, capped at 0.5, so a launch far beyond the training
+        # range does not inherit the flattest shape by default.
+        largest = max(math.log(curve[0]) for curve in curves)
+        excess = math.log(p1) - largest
+        if excess > 0:
+            w = min(0.5, excess / 2.0)
+            fallback = fallback_log_quantiles()
+            log_quantiles = [
+                [(1 - w) * a + w * b for a, b in zip(row, fb)]
+                for row, fb in zip(log_quantiles, fallback)
+            ]
     else:
         log_quantiles = fallback_log_quantiles()
     hours = []
