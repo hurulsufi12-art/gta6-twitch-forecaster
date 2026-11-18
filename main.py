@@ -8,23 +8,32 @@ Method: for each hour, look at every comparable past big launch in the
 case file, take that launch's release-day curve as a ratio to its own
 hour-1 count, and read off the quantiles of the log-ratios -- but weight
 each comparable by how close its hour-1 count is to this case's hour-1
-count (Gaussian kernel, bandwidth 1.0 in log space). Hour-1's size is
-the strongest signal in the data: launches whose hour 1 is already huge
-are already in full swing and stay comparatively flat, while launches
-with a tiny hour 1 are usually still waiting for their unlock and explode
-later. A flat median (the starter) is wrong by ~83% on a typical launch
-day; weighting by hour-1 size is what fixes the shape. The per-hour
-log-quantile curves are lightly smoothed over neighbouring hours.
+count (Gaussian kernel, bandwidth 1.0 in log space), times an unlock
+family factor: launches whose unlock was a rolling midnight local, like
+this case's, count five times as much as launches of the other family
+(one simultaneous global unlock), which count a fifth; launches whose
+unlock is not recorded are neutral. Hour-1's size is the strongest
+signal in the data: launches whose hour 1 is already huge are already
+in full swing and stay comparatively flat, while launches with a tiny
+hour 1 are usually still waiting for their unlock and explode later.
+The unlock family is the second signal: console-only rolling-midnight
+launches keep rising through the day as regions unlock (evening peak
+about 2x hour 1), while launches with a simultaneous global unlock or
+early access are already flat by hour 1. A flat median (the starter)
+is wrong by ~83% on a typical launch day; weighting by hour-1 size is
+what fixes the shape. The per-hour log-quantile curves are lightly
+smoothed over neighbouring hours.
 
 When this case's hour 1 is larger than every comparable's hour 1 -- the
 expected GTA VI situation, since its hour 1 will likely beat the largest
 comparable (875k) -- the kernel would lean on the few biggest launches
-alone, whose shape is flat. The forecast is then blended toward the
-embedded fallback table (the average shape over all 37 launches, evening
-peak ~2.4x hour 1), with the blend weight growing with how far beyond
-the training range the hour-1 print sits, capped at 0.5. In a test that
-trains only on launches under 100k hour-1 viewers and forecasts the 16
-bigger ones, the blend cuts mean pinball loss from 0.305 to 0.295.
+alone, whose shape is flat. The forecast is then blended toward an
+embedded big-launch table (the average shape over the 16 launches with
+hour 1 above 100k, evening peak ~1.25x hour 1), with the blend weight
+growing with how far beyond the training range the hour-1 print sits,
+capped at 0.5. In a test that trains only on launches under 100k hour-1
+viewers and forecasts the 16 bigger ones, the blend cuts mean pinball
+loss from 0.305 to 0.227.
 
 If the case carries too few usable comparables (fewer than 8 complete
 release-day curves), the program falls back to an embedded table: the
@@ -61,6 +70,8 @@ HOURS = list(range(2, 25))
 # Gaussian kernel bandwidth in log(hour-1 viewers): how similar in size
 # a comparable launch must be to count fully.
 BANDWIDTH = 1.0
+FAM_SAME = 5.0
+FAM_DIFF = 0.2
 # Minimum usable comparables for the kernel fit; below this, use the
 # embedded fallback table.
 MIN_COMPARABLES = 8
@@ -84,6 +95,43 @@ FALLBACK_SIG = [
     2.1399, 2.1902, 2.2033, 2.1984, 2.1995, 2.2063, 2.1879,
     2.1528, 2.1399,
 ]
+
+
+# Big-launch fallback table: median log-ratio to hour 1 and log standard
+# deviation per hour (hours 2..24), fitted on the 16 comparable launches
+# with hour-1 >= 100k. Big launches dip to ~0.5x mid-day and peak at
+# only ~1.25x -- far flatter than the all-launch fallback (2.4x peak).
+BIG_MED = [
+    -0.1009, -0.2721, -0.3643, -0.3674, -0.3761, -0.506, -0.5884,
+    -0.6606, -0.6772, -0.6745, -0.562, -0.4507, -0.241, -0.1816,
+    -0.1063, 0.1016, 0.1372, 0.2271, 0.1797, 0.2145, 0.1696, 0.0863,
+    0.1298,
+]
+BIG_SIG = [
+    0.2069, 0.2614, 0.2942, 0.2961, 0.4207, 0.5019, 0.4789,
+    0.4809, 0.4935, 0.4937, 0.4886, 0.4462, 0.4419, 0.4474,
+    0.4408, 0.4232, 0.4156, 0.4098, 0.4211, 0.4058, 0.4231, 0.4049,
+    0.4337,
+]
+
+
+def big_fallback_log_quantiles() -> list[list[float]]:
+    """Log-quantiles from the big-launch fallback table (normal model)."""
+    return [[med + z * sig for z in Z] for med, sig in zip(BIG_MED, BIG_SIG)]
+
+
+
+
+def unlock_family(text: str | None) -> str:
+    """'rolling' (midnight local, region by region), 'global' (one
+    simultaneous unlock worldwide), or 'unknown' from free text."""
+    t = (text or "").lower()
+    if ("midnight local" in t or "rolling" in t or "12 am local" in t
+            or "12am local" in t):
+        return "rolling"
+    if ("simultaneous" in t or "single global" in t or "global unlock" in t):
+        return "global"
+    return "unknown"
 
 
 def round2(x: float) -> float | int:
@@ -153,19 +201,30 @@ def weighted_quantile(pairs: list[tuple[float, float]], q: float) -> float:
     return mids[-1][1]
 
 
-def kernel_log_quantiles(curves: list[list[float]], p1: float) -> list[list[float]]:
+def kernel_log_quantiles(curves: list[list[float]], p1: float,
+                         fams: list[str] | None = None,
+                         target_fam: str = "unknown") -> list[list[float]]:
     """Per-hour log-ratio quantiles, weighted by hour-1 size similarity.
 
     Each comparable contributes its log-ratio ln(v_h / v_1) for hour h,
-    weighted by a Gaussian kernel on |ln(its hour 1) - ln(p1)|. The
-    resulting 23 x 5 table is smoothed with a 3-hour moving average.
+    weighted by a Gaussian kernel on |ln(its hour 1) - ln(p1)|, times a
+    family factor: launches whose unlock family (rolling midnight vs one
+    simultaneous global unlock) matches the target's count more, the
+    others less. Unknown families are neutral.
+    The resulting 23 x 5 table is smoothed with a 3-hour moving average.
     """
     log_p1 = math.log(p1)
     table: list[list[float]] = []
     for h in HOURS:
         pairs = []
-        for curve in curves:
+        for i, curve in enumerate(curves):
             weight = math.exp(-((math.log(curve[0]) - log_p1) ** 2) / (2 * BANDWIDTH * BANDWIDTH))
+            if fams is not None and target_fam != "unknown":
+                fam = fams[i]
+                if fam == target_fam:
+                    weight *= FAM_SAME
+                elif fam != "unknown":
+                    weight *= FAM_DIFF
             pairs.append((math.log(curve[h - 1] / curve[0]), weight))
         table.append([weighted_quantile(pairs, level) for level in LEVELS])
     smooth: list[list[float]] = []
@@ -200,12 +259,15 @@ def hour1_print(case: dict) -> float:
 def forecast_case(case: dict) -> dict:
     p1 = hour1_print(case)
     curves = []
+    fams = []
     for comp in case.get("comparables") or []:
         curve = release_day_curve(comp)
         if curve is not None:
             curves.append(curve)
+            fams.append(unlock_family(comp.get("unlock")))
     if len(curves) >= MIN_COMPARABLES:
-        log_quantiles = kernel_log_quantiles(curves, p1)
+        log_quantiles = kernel_log_quantiles(
+            curves, p1, fams, unlock_family(case.get("notes")))
         # Extrapolation guard: when this case's hour 1 sits beyond the
         # largest comparable, the kernel leans on the few biggest launches
         # alone. Blend toward the fallback table (the average shape over
@@ -216,7 +278,7 @@ def forecast_case(case: dict) -> dict:
         excess = math.log(p1) - largest
         if excess > 0:
             w = min(0.5, excess / 2.0)
-            fallback = fallback_log_quantiles()
+            fallback = big_fallback_log_quantiles()
             log_quantiles = [
                 [(1 - w) * a + w * b for a, b in zip(row, fb)]
                 for row, fb in zip(log_quantiles, fallback)
